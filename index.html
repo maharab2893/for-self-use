@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Infinite Whiteboard</title>
+<style>
+:root{--bg:#fafafa;--panel:rgba(255,255,255,.92);--fg:#262626;--hv:rgba(0,0,0,.07);--bd:rgba(0,0,0,.08)}
+:root[data-theme=dark]{--bg:#171717;--panel:rgba(38,38,38,.92);--fg:#e5e5e5;--hv:rgba(255,255,255,.12);--bd:rgba(255,255,255,.12)}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);font:13px system-ui,sans-serif;color:var(--fg);overscroll-behavior:none}
+canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none;user-select:none;display:block}
+.panel{position:fixed;display:flex;align-items:center;gap:4px;padding:6px;background:var(--panel);border:1px solid var(--bd);border-radius:16px;box-shadow:0 8px 28px rgba(0,0,0,.14);backdrop-filter:blur(10px)}
+#bar{bottom:calc(20px + env(safe-area-inset-bottom,0px));left:50%;transform:translateX(-50%);max-width:calc(100vw - 16px);overflow-x:auto}
+#top{top:calc(16px + env(safe-area-inset-top,0px));right:16px}
+#zoom{bottom:calc(20px + env(safe-area-inset-bottom,0px));right:16px}
+button{font:inherit;color:inherit;background:none;border:0;border-radius:10px;min-width:38px;height:38px;padding:0 10px;cursor:pointer;white-space:nowrap;transition:background .15s,transform .15s}
+button:hover{background:var(--hv);transform:translateY(-1px)}
+button.on{background:#2563eb;color:#fff}
+button:disabled{opacity:.3;pointer-events:none}
+.sw{min-width:24px;width:24px;height:24px;padding:0;border-radius:50%;border:1px solid #8888}
+.sw.on{outline:2px solid #2563eb;outline-offset:2px;background-clip:padding-box}
+.sep{width:1px;height:24px;background:var(--bd);margin:0 4px}
+input[type=color]{width:28px;height:28px;border:0;padding:0;background:none;cursor:pointer}
+#pct{min-width:52px;text-align:center;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div class="panel" id="top">
+  <button id="exp">⬇ Export PDF</button><button id="clr">🗑 Clear</button>
+  <button id="grd" class="on">▦ Grid</button><button id="thm">🌓 Theme</button>
+</div>
+<div class="panel" id="bar">
+  <button data-tool="pen" class="on">✏ Pen</button><button data-tool="laser">🔴 Laser</button><button data-tool="eraser">⌫ Eraser</button>
+  <div class="sep"></div>
+  <button data-w="2">Fine</button><button data-w="4" class="on">Medium</button><button data-w="8">Thick</button>
+  <div class="sep"></div>
+  <span id="sws" style="display:flex;gap:6px;align-items:center"></span>
+  <input type="color" id="cc" value="#000000" title="Custom color">
+  <div class="sep"></div>
+  <button id="und" title="Undo (Ctrl+Z)" disabled>↶</button><button id="red" title="Redo (Ctrl+Y)" disabled>↷</button>
+</div>
+<div class="panel" id="zoom"><span id="pct">100%</span><button id="rz" title="Reset to 100%">↺</button></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+'use strict';
+const $ = s => document.querySelector(s), $$ = s => [...document.querySelectorAll(s)];
+const cv = $('#cv'), ctx = cv.getContext('2d', { alpha: false, desynchronized: true });
+const FADE = 800, MINZ = .1, MAXZ = 5, clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const S = {
+  cam: { x: 0, y: 0, k: 1 }, kt: 1, anc: [0, 0], strokes: [], undo: [], redo: [], cur: null, erased: [],
+  laser: [], q: [], ptrs: new Map(), pinch: null, pan: null, drawId: -1, space: false, dirty: true,
+  nid: 1, w: 0, h: 0, dpr: 1, pct: 100, tool: 'pen', color: '#000000', width: 4, dark: false, grid: true
+};
+const ink = (c, d) => { c = c.toLowerCase(); return d && c === '#000000' ? '#ffffff' : !d && c === '#ffffff' ? '#000000' : c; };
+const world = (x, y) => [(x - S.cam.x) / S.cam.k, (y - S.cam.y) / S.cam.k];
+function zoomBy(f, sx, sy) {
+  const c = S.cam, k = clamp(c.k * f, MINZ, MAXZ), r = k / c.k;
+  c.x = sx - (sx - c.x) * r; c.y = sy - (sy - c.y) * r; c.k = k;
+}
+
+/* ---- Stroke geometry: one filled variable-width outline per stroke (smooth, fast, exportable as vector) ---- */
+function build(s) {
+  const p = s.pts, n = p.length, rad = []; let pr = 0;
+  for (let i = 0; i < n; i++) { const r = s.width * (.5 + p[i][2]) / 2; pr = i ? pr * .6 + r * .4 : r; rad.push(pr); }
+  s.caps = [[p[0][0], p[0][1], rad[0]]]; s.ops = [];
+  if (n > 1) {
+    s.caps.push([p[n - 1][0], p[n - 1][1], rad[n - 1]]);
+    const L = [], R = [];
+    for (let i = 0; i < n; i++) {
+      const a = p[Math.max(0, i - 1)], b = p[Math.min(n - 1, i + 1)];
+      let dx = b[0] - a[0], dy = b[1] - a[1]; const d = Math.hypot(dx, dy) || 1; dx /= d; dy /= d;
+      L.push([p[i][0] - dy * rad[i], p[i][1] + dx * rad[i]]); R.push([p[i][0] + dy * rad[i], p[i][1] - dx * rad[i]]);
+    }
+    const side = (A, first) => {
+      s.ops.push([first ? 'M' : 'L', ...A[0]]);
+      for (let i = 1; i < A.length - 1; i++)
+        s.ops.push(['Q', A[i][0], A[i][1], (A[i][0] + A[i + 1][0]) / 2, (A[i][1] + A[i + 1][1]) / 2]);
+      s.ops.push(['L', ...A[A.length - 1]]);
+    };
+    side(L, true); side(R.reverse(), false);
+  }
+  const poly = new Path2D(), caps = new Path2D();
+  for (const [t, ...a] of s.ops) t === 'M' ? poly.moveTo(...a) : t === 'L' ? poly.lineTo(...a) : poly.quadraticCurveTo(...a);
+  poly.closePath();
+  for (const [x, y, r] of s.caps) { caps.moveTo(x + r, y); caps.arc(x, y, r, 0, 6.2832); }
+  s.poly = poly; s.capsPath = caps;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9; const m = s.width;
+  for (const [x, y] of p) { x0 = Math.min(x0, x - m); y0 = Math.min(y0, y - m); x1 = Math.max(x1, x + m); y1 = Math.max(y1, y + m); }
+  s.bb = [x0, y0, x1, y1];
+}
+const fillStroke = s => { ctx.fillStyle = ink(s.color, S.dark); ctx.fill(s.poly); ctx.fill(s.capsPath); };
+
+/* ---- Hit test / history ---- */
+function hit(s, x, y, r) {
+  const R = r + s.width / 2, p = s.pts;
+  if (x < s.bb[0] - r || x > s.bb[2] + r || y < s.bb[1] - r || y > s.bb[3] + r) return false;
+  if (p.length === 1) return Math.hypot(p[0][0] - x, p[0][1] - y) <= R;
+  for (let i = 1; i < p.length; i++) {
+    const [ax, ay] = p[i - 1], [bx, by] = p[i], dx = bx - ax, dy = by - ay, l = dx * dx + dy * dy;
+    const t = l ? clamp(((x - ax) * dx + (y - ay) * dy) / l, 0, 1) : 0;
+    if (Math.hypot(x - ax - t * dx, y - ay - t * dy) <= R) return true;
+  }
+  return false;
+}
+const notify = () => { S.dirty = true; $('#und').disabled = !S.undo.length; $('#red').disabled = !S.redo.length; };
+const record = (t, s) => { S.undo.push({ t, s }); S.redo = []; notify(); };
+function apply(a, isUndo) {
+  if ((a.t === 'add') === isUndo) { const ids = new Set(a.s.map(s => s.id)); S.strokes = S.strokes.filter(s => !ids.has(s.id)); }
+  else S.strokes = [...S.strokes, ...a.s].sort((x, y) => x.id - y.id);
+  notify();
+}
+const undo = () => { const a = S.undo.pop(); if (a) { S.redo.push(a); apply(a, true); } };
+const redo = () => { const a = S.redo.pop(); if (a) { S.undo.push(a); apply(a, false); } };
+const clearAll = () => { if (S.strokes.length) { const s = S.strokes; S.strokes = []; record('clear', s); } };
+
+/* ---- Input: events only enqueue; the rAF loop consumes ---- */
+const pinchOf = () => { const [a, b] = [...S.ptrs.values()]; return { cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) || 1 }; };
+const laserPt = e => { const [x, y] = world(e.x, e.y); S.laser.push([x, y, performance.now()]); };
+function eraseAt(e) {
+  const [x, y] = world(e.x, e.y), r = 10 / S.cam.k, h = S.strokes.filter(s => hit(s, x, y, r));
+  if (h.length) { S.erased.push(...h); const ids = new Set(h.map(s => s.id)); S.strokes = S.strokes.filter(s => !ids.has(s.id)); S.dirty = true; }
+}
+function endDraw(commit) {
+  if (S.cur) { if (commit) { build(S.cur); S.strokes.push(S.cur); record('add', [S.cur]); } S.cur = null; }
+  else if (S.erased.length) record('erase', S.erased);
+  S.erased = []; S.drawId = -1; S.dirty = true;
+}
+function handle(e) {
+  if (e.k === 'wheel') { S.kt = clamp(S.kt * Math.exp(-e.dy * .0015), MINZ, MAXZ); S.anc = [e.x, e.y]; return; }
+  if (e.k === 'down') {
+    S.ptrs.set(e.id, { x: e.x, y: e.y });
+    if (e.touch && S.ptrs.size === 2) { endDraw(false); S.pinch = pinchOf(); return; }
+    if (S.pinch) return;
+    if (e.btn === 1 || S.space) { S.pan = { id: e.id, x: e.x, y: e.y }; return; }
+    if (e.btn !== 0) return;
+    S.drawId = e.id;
+    if (S.tool === 'pen') { const [x, y] = world(e.x, e.y); S.cur = { id: S.nid++, color: S.color, width: S.width, pts: [[x, y, e.p]] }; }
+    else if (S.tool === 'eraser') { S.erased = []; eraseAt(e); } else laserPt(e);
+    S.dirty = true;
+  } else if (e.k === 'move') {
+    if (S.ptrs.has(e.id)) S.ptrs.set(e.id, { x: e.x, y: e.y });
+    if (S.pinch && S.ptrs.size >= 2) {
+      const n = pinchOf(), o = S.pinch; zoomBy(n.d / o.d, o.cx, o.cy);
+      S.cam.x += n.cx - o.cx; S.cam.y += n.cy - o.cy; S.kt = S.cam.k; S.pinch = n; S.dirty = true; return;
+    }
+    if (S.pan && S.pan.id === e.id) { S.cam.x += e.x - S.pan.x; S.cam.y += e.y - S.pan.y; S.pan.x = e.x; S.pan.y = e.y; S.dirty = true; return; }
+    if (S.tool === 'laser' && !S.pinch) { laserPt(e); return; }
+    if (S.drawId !== e.id) return;
+    if (S.tool === 'pen' && S.cur) { const [x, y] = world(e.x, e.y), l = S.cur.pts[S.cur.pts.length - 1]; if (Math.hypot(x - l[0], y - l[1]) * S.cam.k >= .8) S.cur.pts.push([x, y, e.p]); }
+    else if (S.tool === 'eraser') eraseAt(e);
+    S.dirty = true;
+  } else {
+    S.ptrs.delete(e.id); if (S.ptrs.size < 2) S.pinch = null;
+    if (S.pan && S.pan.id === e.id) S.pan = null;
+    if (S.drawId === e.id) endDraw(true);
+  }
+}
+const mk = (k, e, r) => ({ k, id: e.pointerId, x: e.clientX - r.left, y: e.clientY - r.top, p: e.pointerType === 'pen' && e.pressure > 0 ? e.pressure : .5, btn: e.button, touch: e.pointerType === 'touch', dy: 0 });
+cv.addEventListener('pointerdown', e => { e.preventDefault(); cv.setPointerCapture(e.pointerId); S.q.push(mk('down', e, cv.getBoundingClientRect())); });
+cv.addEventListener('pointermove', e => { const r = cv.getBoundingClientRect(), l = e.getCoalescedEvents ? e.getCoalescedEvents() : []; for (const c of l.length ? l : [e]) S.q.push(mk('move', c, r)); });
+for (const t of ['pointerup', 'pointercancel']) cv.addEventListener(t, e => S.q.push(mk('up', e, cv.getBoundingClientRect())));
+cv.addEventListener('wheel', e => { e.preventDefault(); const r = cv.getBoundingClientRect(); S.q.push({ k: 'wheel', x: e.clientX - r.left, y: e.clientY - r.top, dy: e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY }); }, { passive: false });
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'Space') { S.space = true; cv.style.cursor = 'grab'; e.preventDefault(); }
+  if (e.ctrlKey || e.metaKey) { const k = e.key.toLowerCase(); if (k === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); } else if (k === 'y') { e.preventDefault(); redo(); } }
+});
+addEventListener('keyup', e => { if (e.code === 'Space') { S.space = false; setCursor(); } });
+
+/* ---- Render ---- */
+function drawGrid() {
+  const c = S.cam; let step = 24; while (step * c.k < 14) step *= 2;
+  const sp = step * c.k, ox = ((c.x % sp) + sp) % sp, oy = ((c.y % sp) + sp) % sp, r = clamp(.5 + c.k * .5, .8, 2.2);
+  ctx.fillStyle = S.dark ? 'rgba(255,255,255,.18)' : 'rgba(0,0,0,.18)'; ctx.beginPath();
+  for (let x = ox; x < S.w; x += sp) for (let y = oy; y < S.h; y += sp) ctx.rect(x - r, y - r, r * 2, r * 2);
+  ctx.fill();
+}
+function drawLaser(now) {
+  const col = S.dark ? '#22d3ee' : '#ef4444', k = S.cam.k, p = S.laser;
+  ctx.lineCap = 'round'; ctx.strokeStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 14;
+  for (let i = 1; i < p.length; i++) {
+    const a = 1 - (now - p[i][2]) / FADE; if (a <= 0) continue;
+    ctx.globalAlpha = a; ctx.lineWidth = (2 + 5 * a) / k;
+    ctx.beginPath(); ctx.moveTo(p[i - 1][0], p[i - 1][1]); ctx.lineTo(p[i][0], p[i][1]); ctx.stroke();
+  }
+  const h = p[p.length - 1];
+  if (h && now - h[2] < 150) { ctx.globalAlpha = 1; ctx.fillStyle = col; ctx.beginPath(); ctx.arc(h[0], h[1], 6 / k, 0, 6.2832); ctx.fill(); }
+  ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+}
+function render(now) {
+  const d = S.dpr, c = S.cam;
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = S.dark ? '#171717' : '#fafafa'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(d, 0, 0, d, 0, 0); if (S.grid) drawGrid();
+  ctx.setTransform(d * c.k, 0, 0, d * c.k, d * c.x, d * c.y);
+  const x0 = -c.x / c.k, y0 = -c.y / c.k, x1 = x0 + S.w / c.k, y1 = y0 + S.h / c.k;
+  for (const s of S.strokes) { const b = s.bb; if (b[2] < x0 || b[0] > x1 || b[3] < y0 || b[1] > y1) continue; fillStroke(s); }
+  if (S.cur) { build(S.cur); fillStroke(S.cur); }
+  if (S.laser.length) drawLaser(now);
+  const pct = Math.round(c.k * 100); if (pct !== S.pct) { S.pct = pct; $('#pct').textContent = pct + '%'; }
+}
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  if (S.q.length) { const q = S.q; S.q = []; for (const e of q) handle(e); }
+  if (Math.abs(S.kt - S.cam.k) > 1e-4) { // smooth, frame-rate independent zoom easing
+    const nk = S.cam.k + (S.kt - S.cam.k) * (1 - Math.exp(-dt * 20)); zoomBy(nk / S.cam.k, S.anc[0], S.anc[1]); S.dirty = true;
+  }
+  if (S.laser.length) { S.dirty = true; const cut = performance.now() - FADE; while (S.laser.length && S.laser[0][2] < cut) S.laser.shift(); }
+  if (S.dirty) { S.dirty = false; render(performance.now()); }
+  requestAnimationFrame(frame);
+}
+new ResizeObserver(() => {
+  const r = cv.getBoundingClientRect(); S.dpr = devicePixelRatio || 1; S.w = r.width; S.h = r.height;
+  cv.width = Math.round(r.width * S.dpr); cv.height = Math.round(r.height * S.dpr); S.dirty = true;
+}).observe(cv);
+requestAnimationFrame(frame);
+
+/* ---- Vector PDF export (outlines -> cubic Beziers, true vector, no raster) ---- */
+function exportPdf() {
+  if (!S.strokes.length) return;
+  let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+  for (const s of S.strokes) { x0 = Math.min(x0, s.bb[0]); y0 = Math.min(y0, s.bb[1]); x1 = Math.max(x1, s.bb[2]); y1 = Math.max(y1, s.bb[3]); }
+  const pad = 40, W = x1 - x0 + pad * 2, H = y1 - y0 + pad * 2, sc = Math.min(1, 14000 / Math.max(W, H));
+  const doc = new window.jspdf.jsPDF({ unit: 'pt', format: [W * sc, H * sc], orientation: W > H ? 'l' : 'p' });
+  doc.setFillColor(S.dark ? '#171717' : '#ffffff'); doc.rect(0, 0, W * sc, H * sc, 'F');
+  const T = (x, y) => [(x - x0 + pad) * sc, (y - y0 + pad) * sc];
+  for (const s of S.strokes) {
+    doc.setFillColor(ink(s.color, S.dark));
+    if (s.ops.length) {
+      const segs = []; let cx = 0, cy = 0, sx = 0, sy = 0;
+      for (const [t, ...a] of s.ops) {
+        if (t === 'M') { [sx, sy] = T(a[0], a[1]); cx = sx; cy = sy; }
+        else if (t === 'L') { const [nx, ny] = T(a[0], a[1]); segs.push([nx - cx, ny - cy]); cx = nx; cy = ny; }
+        else {
+          const [qx, qy] = T(a[0], a[1]), [nx, ny] = T(a[2], a[3]);
+          segs.push([(cx + 2 / 3 * (qx - cx)) - cx, (cy + 2 / 3 * (qy - cy)) - cy, (nx + 2 / 3 * (qx - nx)) - cx, (ny + 2 / 3 * (qy - ny)) - cy, nx - cx, ny - cy]);
+          cx = nx; cy = ny;
+        }
+      }
+      doc.lines(segs, sx, sy, [1, 1], 'F', true);
+    }
+    for (const [x, y, r] of s.caps) { const [px, py] = T(x, y); doc.circle(px, py, r * sc, 'F'); }
+  }
+  doc.save('whiteboard.pdf');
+}
+
+/* ---- UI wiring ---- */
+const setCursor = () => cv.style.cursor = S.tool === 'eraser' ? 'cell' : S.tool === 'laser' ? 'none' : 'crosshair';
+const pick = (sel, el) => { $$(sel).forEach(b => b.classList.toggle('on', b === el)); };
+$$('[data-tool]').forEach(b => b.onclick = () => { S.tool = b.dataset.tool; pick('[data-tool]', b); setCursor(); });
+$$('[data-w]').forEach(b => b.onclick = () => { S.width = +b.dataset.w; pick('[data-w]', b); });
+const sws = $('#sws');
+function setColor(c) { S.color = c; $('#cc').value = c; $$('.sw').forEach(b => b.classList.toggle('on', b.dataset.c === c)); }
+['#000000', '#2563eb', '#ef4444', '#16a34a', '#ffffff'].forEach(c => {
+  const b = document.createElement('button'); b.className = 'sw'; b.dataset.c = c; b.style.background = c; b.title = c; b.onclick = () => setColor(c); sws.append(b);
+});
+$('#cc').oninput = e => setColor(e.target.value);
+$('#und').onclick = undo; $('#red').onclick = redo; $('#clr').onclick = clearAll; $('#exp').onclick = exportPdf;
+$('#grd').onclick = e => { S.grid = !S.grid; e.currentTarget.classList.toggle('on', S.grid); S.dirty = true; };
+$('#thm').onclick = () => { S.dark = !S.dark; document.documentElement.dataset.theme = S.dark ? 'dark' : ''; S.dirty = true; };
+$('#rz').onclick = () => { S.kt = 1; S.anc = [S.w / 2, S.h / 2]; };
+setColor('#000000'); setCursor();
+</script>
+</body>
+</html>
